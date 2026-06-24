@@ -1,0 +1,195 @@
+trigger: none  # Manual trigger only
+
+pr: none
+
+parameters:
+  - name: environment
+    displayName: "Target environment"
+    type: string
+    default: dev
+    values: [dev, pre, prod]
+
+  - name: imageTag
+    displayName: "Image tag (leave empty to use build ID)"
+    type: string
+    default: ""
+
+variables:
+  - group: k8s-global          # ACR_LOGIN_SERVER, APP_NAME, AKS_NAME, AKS_RESOURCE_GROUP
+  - name: NAMESPACE
+    value: "$(APP_NAME)-${{ parameters.environment }}"
+  - name: EFFECTIVE_TAG
+    value: ${{ coalesce(parameters.imageTag, '$(Build.BuildId)') }}
+  - name: FULL_IMAGE
+    value: "$(ACR_LOGIN_SERVER)/$(APP_NAME):$(EFFECTIVE_TAG)"
+
+  - ${{ if eq(parameters.environment, 'dev') }}:
+    - group: k8s-dev
+  - ${{ if eq(parameters.environment, 'pre') }}:
+    - group: k8s-pre
+  - ${{ if eq(parameters.environment, 'prod') }}:
+    - group: k8s-prod
+
+stages:
+  # ─────────────────────────────────────────────────────
+  # STAGE 1 — Build image and push to ACR
+  # ─────────────────────────────────────────────────────
+  - stage: Build
+    displayName: "Build & Push (${{ parameters.environment }})"
+    jobs:
+      - job: build_image
+        displayName: "Docker build + ACR push"
+        pool:
+          vmImage: ubuntu-latest
+
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "ACR login"
+            inputs:
+              azureSubscription: "azure-service-connection"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az acr login --name "$(ACR_LOGIN_SERVER)"
+
+          - task: Docker@2
+            displayName: "Build image"
+            inputs:
+              command: build
+              repository: "$(ACR_LOGIN_SERVER)/$(APP_NAME)"
+              dockerfile: "$(Build.SourcesDirectory)/Dockerfile"
+              buildContext: "$(Build.SourcesDirectory)"
+              tags: |
+                $(EFFECTIVE_TAG)
+                latest
+
+          - task: Docker@2
+            displayName: "Push image"
+            inputs:
+              command: push
+              repository: "$(ACR_LOGIN_SERVER)/$(APP_NAME)"
+              containerRegistry: "acr-service-connection"
+              tags: |
+                $(EFFECTIVE_TAG)
+                latest
+
+          - bash: |
+              echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$(EFFECTIVE_TAG)"
+            name: set_tag
+            displayName: "Export image tag"
+
+  # ─────────────────────────────────────────────────────
+  # STAGE 2 — Deploy to AKS
+  # Approval gate configured per environment:
+  #   Pipelines → Environments → dev/pre/prod → Approvals and checks
+  # ─────────────────────────────────────────────────────
+  - stage: Deploy
+    displayName: "Deploy (${{ parameters.environment }})"
+    dependsOn: Build
+    variables:
+      IMAGE_TAG: $[ stageDependencies.Build.build_image.outputs['set_tag.IMAGE_TAG'] ]
+
+    jobs:
+      - deployment: deploy_k8s
+        displayName: "kubectl deploy"
+        pool:
+          vmImage: ubuntu-latest
+        environment: ${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: "Get AKS credentials"
+                  inputs:
+                    azureSubscription: "azure-service-connection"
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az aks get-credentials \
+                        --name "$(AKS_NAME)" \
+                        --resource-group "$(AKS_RESOURCE_GROUP)" \
+                        --overwrite-existing
+
+                - bash: |
+                    echo "=== Diff before deploy ==="
+                    kubectl diff \
+                      -f - <<EOF
+                    apiVersion: apps/v1
+                    kind: Deployment
+                    metadata:
+                      name: $(APP_NAME)
+                      namespace: $(NAMESPACE)
+                    spec:
+                      template:
+                        spec:
+                          containers:
+                          - name: $(APP_NAME)
+                            image: $(ACR_LOGIN_SERVER)/$(APP_NAME):$(IMAGE_TAG)
+                    EOF
+                  displayName: "Show diff (kubectl diff)"
+                  continueOnError: true
+
+                - task: Kubernetes@1
+                  displayName: "kubectl set image"
+                  inputs:
+                    connectionType: Azure Resource Manager
+                    azureSubscriptionEndpoint: "azure-service-connection"
+                    azureResourceGroup: "$(AKS_RESOURCE_GROUP)"
+                    kubernetesCluster: "$(AKS_NAME)"
+                    namespace: "$(NAMESPACE)"
+                    command: set
+                    arguments: >
+                      image deployment/$(APP_NAME)
+                      $(APP_NAME)=$(ACR_LOGIN_SERVER)/$(APP_NAME):$(IMAGE_TAG)
+
+                - task: Kubernetes@1
+                  displayName: "kubectl rollout status"
+                  inputs:
+                    connectionType: Azure Resource Manager
+                    azureSubscriptionEndpoint: "azure-service-connection"
+                    azureResourceGroup: "$(AKS_RESOURCE_GROUP)"
+                    kubernetesCluster: "$(AKS_NAME)"
+                    namespace: "$(NAMESPACE)"
+                    command: rollout
+                    arguments: "status deployment/$(APP_NAME) --timeout=5m"
+
+                - task: Kubernetes@1
+                  displayName: "Show pods"
+                  inputs:
+                    connectionType: Azure Resource Manager
+                    azureSubscriptionEndpoint: "azure-service-connection"
+                    azureResourceGroup: "$(AKS_RESOURCE_GROUP)"
+                    kubernetesCluster: "$(AKS_NAME)"
+                    namespace: "$(NAMESPACE)"
+                    command: get
+                    arguments: "pods -o wide"
+
+            on:
+              failure:
+                steps:
+                  - task: AzureCLI@2
+                    displayName: "Rollback on failure"
+                    inputs:
+                      azureSubscription: "azure-service-connection"
+                      scriptType: bash
+                      scriptLocation: inlineScript
+                      inlineScript: |
+                        az aks get-credentials \
+                          --name "$(AKS_NAME)" \
+                          --resource-group "$(AKS_RESOURCE_GROUP)" \
+                          --overwrite-existing
+
+                        echo "Rolling back deployment $(APP_NAME) in $(NAMESPACE)..."
+                        kubectl rollout undo deployment/$(APP_NAME) -n $(NAMESPACE)
+
+                        kubectl rollout status deployment/$(APP_NAME) \
+                          -n $(NAMESPACE) \
+                          --timeout=3m
+
+                        echo "Rollback complete. Current pods:"
+                        kubectl get pods -n $(NAMESPACE) -o wide

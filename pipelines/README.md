@@ -1,20 +1,37 @@
 # Pipelines CI/CD
 
-Ejemplos de pipeline para desplegar la infraestructura del directorio `live/`
-en los entornos **dev**, **pre** y **prod**.
+Este directorio cubre tres tipos de despliegue, cada uno disponible para
+GitHub Actions, Azure DevOps y Jenkins:
 
-Los tres siguen el mismo flujo:
+| Tipo | Cuándo usarlo |
+|---|---|
+| **Terraform (Azure)** | Provisionar infraestructura Azure via Terraform |
+| **Kubernetes (AKS)** | Desplegar contenedores en Azure Kubernetes Service |
+| **Kubernetes (On-Premise)** | Desplegar en un cluster k8s propio (kubeconfig) |
+| **Ansible (On-Premise)** | Desplegar en servidores Linux con Docker vía Ansible/SSH |
+
+Todos siguen el mismo principio:
 
 ```
-validate → plan (visible) → aprobación manual → apply / destroy
+build/plan (visible) → aprobación manual → deploy/apply
 ```
 
-El plan siempre se ejecuta primero y queda visible antes de que nadie pueda
-aprobar el apply. Nadie aplica cambios sin haber leído el plan.
+Nadie ejecuta cambios sin haber visto antes qué va a cambiar.
 
 ---
 
-## Tabla comparativa
+## Ficheros
+
+| Pipeline | GitHub Actions | Azure DevOps | Jenkins |
+|---|---|---|---|
+| Terraform (Azure) | `.github/workflows/terraform-deploy.yml` | `pipelines/azure-devops/azure-pipelines.yml` | `pipelines/jenkins/Jenkinsfile` |
+| Kubernetes (AKS) | `.github/workflows/k8s-deploy.yml` | `pipelines/azure-devops/k8s-deploy.yml` | `pipelines/jenkins/Jenkinsfile-k8s` |
+| Kubernetes (On-Prem) | `.github/workflows/k8s-onpremise.yml` | `pipelines/azure-devops/k8s-onpremise.yml` | `pipelines/jenkins/Jenkinsfile-k8s-onpremise` |
+| Ansible (On-Prem) | `.github/workflows/ansible-deploy.yml` | `pipelines/azure-devops/ansible-deploy.yml` | `pipelines/jenkins/Jenkinsfile-ansible` |
+
+---
+
+## Tabla comparativa (Terraform)
 
 | Característica | GitHub Actions | Azure DevOps | Jenkins |
 |---|---|---|---|
@@ -184,9 +201,83 @@ El flujo:
 
 ---
 
+## Kubernetes On-Premise
+
+Usa los mismos pipelines (`k8s-onpremise.*`) pero sin dependencia de Azure.
+La autenticación es un **kubeconfig guardado como secreto** (base64-encoded).
+
+### Generar el secreto de kubeconfig
+
+```bash
+# En tu máquina local, con acceso al cluster:
+base64 -w0 ~/.kube/config
+# Pega el resultado en:
+#   GitHub  → Settings → Secrets → KUBECONFIG_DEV / _PRE / _PROD
+#   AzDevOps → Library → Variable Group → KUBECONFIG_B64 (marcar como secreto)
+#   Jenkins  → Credentials → Secret file → KUBECONFIG_DEV / _PRE / _PROD
+```
+
+### Variables necesarias
+
+| Variable | Valor |
+|---|---|
+| `REGISTRY_HOST` | Hostname del registry on-prem (e.g. `harbor.company.com`) |
+| `REGISTRY_USER` | Usuario del registry |
+| `REGISTRY_PASSWORD` | Contraseña del registry |
+| `APP_NAME` | Nombre de la aplicación |
+| `KUBECONFIG_DEV/PRE/PROD` | kubeconfig en base64 por entorno |
+
+---
+
+## Ansible On-Premise
+
+Para servidores Linux que corren Docker directamente (sin Kubernetes).
+El pipeline construye la imagen, la sube al registry, y usa Ansible para
+conectarse por SSH y reiniciar el contenedor.
+
+### Estructura Ansible esperada
+
+```
+ansible/
+  inventories/
+    dev/hosts.ini      ← IPs/hostnames de los servidores de dev
+    pre/hosts.ini
+    prod/hosts.ini
+  playbooks/
+    deploy.yml         ← playbook incluido en este repo como ejemplo
+```
+
+### Variables necesarias
+
+| Variable | Valor |
+|---|---|
+| `REGISTRY_HOST` | Hostname del registry |
+| `REGISTRY_USER` | Usuario del registry |
+| `REGISTRY_PASSWORD` | Contraseña del registry |
+| `APP_NAME` | Nombre de la aplicación |
+| `SSH_PRIVATE_KEY` | Clave privada SSH del usuario de deploy |
+
+### Flujo del pipeline Ansible
+
+1. **Build** — construye y sube la imagen al registry
+2. **Plan** — ejecuta `ansible-playbook --check --diff` (dry-run sin cambios reales)
+3. **Approval** — muestra el diff del dry-run, espera confirmación
+4. **Deploy** — ejecuta el playbook real (`--diff`)
+
+El playbook incluido (`ansible/playbooks/deploy.yml`):
+- Verifica que Docker está instalado y corriendo
+- Hace `docker pull` de la nueva imagen
+- Para el contenedor antiguo (graceful, 30 s timeout)
+- Arranca el nuevo contenedor
+- Espera el health check en `/healthz` (configurable)
+
+---
+
 ## Recomendaciones de seguridad
 
 - **Nunca** guardes `*.tfvars` con contraseñas en el repositorio
 - Usa siempre OIDC / federated credentials en lugar de secretos de larga duración
 - El estado de Terraform contiene valores sensibles — asegúrate de que el Storage Account tiene acceso restringido y cifrado en reposo activado
 - Revisa el plan completo antes de aprobar: presta especial atención a las líneas con `# will be destroyed` y `# must be replaced`
+- Para Kubernetes on-prem: usa un kubeconfig de Service Account con permisos mínimos (solo `get/list/watch/update` en Deployments del namespace concreto), no el kubeconfig de admin del cluster
+- Para Ansible: crea un usuario `deploy` sin contraseña en los servidores, autoriza solo su clave pública, y no lo añadas al grupo `sudo` — usa `become` con contraseña distinta si necesitas permisos de root

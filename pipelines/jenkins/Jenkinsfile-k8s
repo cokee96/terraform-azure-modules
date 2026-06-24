@@ -1,0 +1,271 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'pre', 'prod'],
+            description: 'Target environment'
+        )
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: '',
+            description: 'Image tag to deploy. Leave empty to use the build number.'
+        )
+    }
+
+    environment {
+        // Registry and app settings — configure in Jenkins → Credentials or global variables
+        ACR_LOGIN_SERVER = credentials('ACR_LOGIN_SERVER')
+        APP_NAME         = credentials('APP_NAME')
+        AKS_NAME         = credentials('AKS_NAME')
+        AKS_RESOURCE_GROUP = credentials('AKS_RESOURCE_GROUP')
+
+        // Azure service principal — configure in Jenkins → Credentials
+        // Kind: Secret text
+        AZURE_CLIENT_ID       = credentials('AZURE_CLIENT_ID')
+        AZURE_CLIENT_SECRET   = credentials('AZURE_CLIENT_SECRET')
+        AZURE_TENANT_ID       = credentials('AZURE_TENANT_ID')
+        AZURE_SUBSCRIPTION_ID = credentials('AZURE_SUBSCRIPTION_ID')
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        ansiColor('xterm')
+        timestamps()
+    }
+
+    stages {
+        // ─────────────────────────────────────────────────────
+        // STAGE 1 — Resolve image tag
+        // ─────────────────────────────────────────────────────
+        stage('Resolve Tag') {
+            steps {
+                script {
+                    env.EFFECTIVE_TAG = params.IMAGE_TAG?.trim() ? params.IMAGE_TAG.trim() : env.BUILD_NUMBER
+                    env.NAMESPACE     = "${env.APP_NAME}-${params.ENVIRONMENT}"
+                    env.FULL_IMAGE    = "${env.ACR_LOGIN_SERVER}/${env.APP_NAME}:${env.EFFECTIVE_TAG}"
+
+                    echo "Image  : ${env.FULL_IMAGE}"
+                    echo "Namespace: ${env.NAMESPACE}"
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────
+        // STAGE 2 — Build Docker image
+        // ─────────────────────────────────────────────────────
+        stage('Build') {
+            steps {
+                script {
+                    docker.build("${env.ACR_LOGIN_SERVER}/${env.APP_NAME}:${env.EFFECTIVE_TAG}", '.')
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────
+        // STAGE 3 — Push to ACR
+        // ─────────────────────────────────────────────────────
+        stage('Push') {
+            steps {
+                script {
+                    // Login to Azure and ACR
+                    sh """
+                        az login \
+                          --service-principal \
+                          --username "${env.AZURE_CLIENT_ID}" \
+                          --password "${env.AZURE_CLIENT_SECRET}" \
+                          --tenant "${env.AZURE_TENANT_ID}"
+
+                        az account set --subscription "${env.AZURE_SUBSCRIPTION_ID}"
+                        az acr login --name "${env.ACR_LOGIN_SERVER}"
+                    """
+
+                    docker.withRegistry("https://${env.ACR_LOGIN_SERVER}") {
+                        def img = docker.image("${env.ACR_LOGIN_SERVER}/${env.APP_NAME}:${env.EFFECTIVE_TAG}")
+                        img.push(env.EFFECTIVE_TAG)
+                        img.push('latest')
+                    }
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────
+        // STAGE 4 — Plan (kubectl diff)
+        // Shows what will change in the cluster before deploying.
+        // ─────────────────────────────────────────────────────
+        stage('Plan') {
+            steps {
+                script {
+                    sh """
+                        az aks get-credentials \
+                          --name "${env.AKS_NAME}" \
+                          --resource-group "${env.AKS_RESOURCE_GROUP}" \
+                          --overwrite-existing
+                    """
+
+                    def diffOutput = sh(
+                        script: """
+                            kubectl diff \
+                              -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${env.APP_NAME}
+  namespace: ${env.NAMESPACE}
+spec:
+  template:
+    spec:
+      containers:
+      - name: ${env.APP_NAME}
+        image: ${env.FULL_IMAGE}
+EOF
+                        """,
+                        returnStdout: true,
+                        returnStatus: false
+                    ).trim()
+
+                    env.KUBECTL_DIFF = diffOutput ?: 'No differences detected — image tag is the only change.'
+                    echo "=== kubectl diff output ===\n${env.KUBECTL_DIFF}"
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────
+        // STAGE 5 — Approval
+        // Shows the diff and waits for a human to approve.
+        // In prod only team-leads and admin can approve.
+        // ─────────────────────────────────────────────────────
+        stage('Approval') {
+            steps {
+                script {
+                    def maxChars = 4000
+                    def diff = env.KUBECTL_DIFF ?: ''
+                    def displayDiff = diff.length() > maxChars
+                        ? diff.substring(diff.length() - maxChars)
+                        : diff
+
+                    def msg = """
+╔══════════════════════════════════════════════════════════════╗
+║  ENVIRONMENT : ${params.ENVIRONMENT.toUpperCase()}
+║  IMAGE       : ${env.FULL_IMAGE}
+║  NAMESPACE   : ${env.NAMESPACE}
+╚══════════════════════════════════════════════════════════════╝
+
+=== kubectl diff ===
+${displayDiff}
+
+Deploy ${env.FULL_IMAGE} to ${params.ENVIRONMENT}?
+                    """
+
+                    def approvers = params.ENVIRONMENT == 'prod' ? 'admin,team-leads' : ''
+
+                    timeout(time: 30, unit: 'MINUTES') {
+                        input(
+                            message: msg,
+                            ok: "Deploy to ${params.ENVIRONMENT}",
+                            submitter: approvers
+                        )
+                    }
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────
+        // STAGE 6 — Deploy
+        // ─────────────────────────────────────────────────────
+        stage('Deploy') {
+            steps {
+                script {
+                    sh """
+                        kubectl set image deployment/${env.APP_NAME} \
+                          ${env.APP_NAME}=${env.FULL_IMAGE} \
+                          -n ${env.NAMESPACE}
+                    """
+
+                    sh """
+                        kubectl rollout status deployment/${env.APP_NAME} \
+                          -n ${env.NAMESPACE} \
+                          --timeout=5m
+                    """
+
+                    sh """
+                        echo "=== Pods after deploy ==="
+                        kubectl get pods -n ${env.NAMESPACE} -o wide
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────
+        // STAGE 7 — Smoke Test
+        // Basic curl test against the service endpoint.
+        // ─────────────────────────────────────────────────────
+        stage('Verify') {
+            steps {
+                script {
+                    def clusterIP = sh(
+                        script: "kubectl get svc ${env.APP_NAME} -n ${env.NAMESPACE} -o jsonpath='{.spec.clusterIP}'",
+                        returnStdout: true
+                    ).trim()
+
+                    def httpPort = sh(
+                        script: "kubectl get svc ${env.APP_NAME} -n ${env.NAMESPACE} -o jsonpath='{.spec.ports[0].port}'",
+                        returnStdout: true
+                    ).trim()
+
+                    sh """
+                        echo "Running smoke test against http://${clusterIP}:${httpPort}/healthz"
+                        kubectl run smoke-test-${env.BUILD_NUMBER} \
+                          --image=curlimages/curl:latest \
+                          --restart=Never \
+                          --rm \
+                          -n ${env.NAMESPACE} \
+                          -- curl -sf --retry 5 --retry-delay 3 \
+                             http://${clusterIP}:${httpPort}/healthz
+                    """
+
+                    echo "Smoke test passed."
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Deployment of ${env.FULL_IMAGE} to ${params.ENVIRONMENT} completed successfully."
+        }
+
+        failure {
+            script {
+                echo "Deployment failed — attempting rollback..."
+                try {
+                    sh """
+                        az aks get-credentials \
+                          --name "${env.AKS_NAME}" \
+                          --resource-group "${env.AKS_RESOURCE_GROUP}" \
+                          --overwrite-existing
+
+                        kubectl rollout undo deployment/${env.APP_NAME} \
+                          -n ${env.NAMESPACE}
+
+                        kubectl rollout status deployment/${env.APP_NAME} \
+                          -n ${env.NAMESPACE} \
+                          --timeout=3m
+
+                        echo "Rollback complete. Current pods:"
+                        kubectl get pods -n ${env.NAMESPACE} -o wide
+                    """
+                    echo "Rollback successful."
+                } catch (rollbackErr) {
+                    echo "Rollback also failed: ${rollbackErr}"
+                }
+            }
+        }
+
+        always {
+            sh 'az logout || true'
+        }
+    }
+}
