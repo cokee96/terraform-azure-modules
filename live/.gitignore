@@ -1,0 +1,14 @@
+# Estado de Terraform — NUNCA subir al repo
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+*.tfstate
+*.tfstate.*
+
+# Variables con secretos — usar TF_VAR_* en su lugar
+*.auto.tfvars
+secrets.tfvars
+
+# Planes de ejecución (pueden contener valores sensibles)
+*.tfplan
