@@ -1,0 +1,189 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'pre', 'prod'],
+            description: 'Entorno a desplegar'
+        )
+        choice(
+            name: 'ACTION',
+            choices: ['plan', 'apply', 'destroy'],
+            description: 'Acción a ejecutar'
+        )
+    }
+
+    environment {
+        TF_VERSION   = '1.8.5'
+        WORKING_DIR  = "${WORKSPACE}/live"
+        TF_IN_AUTOMATION = 'true'
+
+        // Credenciales de Azure — configurar en Jenkins → Credentials
+        // Kind: Secret text, ID: AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / etc.
+        ARM_CLIENT_ID       = credentials('AZURE_CLIENT_ID')
+        ARM_CLIENT_SECRET   = credentials('AZURE_CLIENT_SECRET')
+        ARM_TENANT_ID       = credentials('AZURE_TENANT_ID')
+        ARM_SUBSCRIPTION_ID = credentials('AZURE_SUBSCRIPTION_ID')
+        TF_VAR_sql_admin_password = credentials('SQL_ADMIN_PASSWORD')
+
+        // Backend — configurar en Jenkins → Credentials o como variables globales
+        TF_BACKEND_RG = credentials('TF_BACKEND_RG')
+        TF_BACKEND_SA = credentials('TF_BACKEND_SA')
+    }
+
+    options {
+        timeout(time: 60, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        ansiColor('xterm')
+        timestamps()
+    }
+
+    stages {
+        // ─────────────────────────────────────────────────────
+        // INIT
+        // ─────────────────────────────────────────────────────
+        stage('Init') {
+            steps {
+                dir(WORKING_DIR) {
+                    sh """
+                        terraform init \\
+                          -backend-config="resource_group_name=${TF_BACKEND_RG}" \\
+                          -backend-config="storage_account_name=${TF_BACKEND_SA}" \\
+                          -backend-config="container_name=tfstate" \\
+                          -backend-config="key=${params.ENVIRONMENT}.tfstate" \\
+                          -reconfigure
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────
+        // VALIDATE
+        // ─────────────────────────────────────────────────────
+        stage('Validate') {
+            steps {
+                dir(WORKING_DIR) {
+                    sh 'terraform fmt -check -recursive'
+                    sh 'terraform validate'
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────
+        // PLAN — siempre se ejecuta, el output se muestra completo
+        // ─────────────────────────────────────────────────────
+        stage('Plan') {
+            steps {
+                dir(WORKING_DIR) {
+                    sh """
+                        terraform plan \\
+                          -var-file="${params.ENVIRONMENT}.tfvars" \\
+                          -out=tfplan \\
+                          -no-color \\
+                          2>&1 | tee plan.txt
+
+                        echo "\\n===== RESUMEN ====="
+                        grep -E "^Plan:|No changes|must be replaced|will be created|will be destroyed|will be updated" plan.txt || true
+                    """
+                }
+                // Archiva el plan para auditoría
+                archiveArtifacts artifacts: 'live/tfplan, live/plan.txt', fingerprint: true
+            }
+        }
+
+        // ─────────────────────────────────────────────────────
+        // APPROVAL — muestra el plan y espera confirmación
+        // En dev solo si ACTION=apply; en pre y prod siempre
+        // ─────────────────────────────────────────────────────
+        stage('Approval') {
+            when {
+                anyOf {
+                    expression { params.ACTION == 'apply' }
+                    expression { params.ACTION == 'destroy' }
+                }
+            }
+            steps {
+                script {
+                    def planText = readFile("${WORKING_DIR}/plan.txt")
+
+                    // Truncar si es muy largo para el diálogo
+                    def maxChars = 5000
+                    def displayPlan = planText.length() > maxChars
+                        ? planText.substring(planText.length() - maxChars)
+                        : planText
+
+                    def msg = """
+                        ╔══════════════════════════════════════════════════════════╗
+                        ║  ENTORNO: ${params.ENVIRONMENT.toUpperCase()}  |  ACCIÓN: ${params.ACTION.toUpperCase()}
+                        ╚══════════════════════════════════════════════════════════╝
+
+                        ${displayPlan}
+
+                        ¿Deseas continuar con el ${params.ACTION} en ${params.ENVIRONMENT}?
+                    """
+
+                    timeout(time: 30, unit: 'MINUTES') {
+                        input(
+                            message: msg,
+                            ok: "Sí, ejecutar ${params.ACTION} en ${params.ENVIRONMENT}",
+                            submitter: env.ENVIRONMENT == 'prod' ? 'admin,team-leads' : ''
+                        )
+                    }
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────
+        // APPLY
+        // ─────────────────────────────────────────────────────
+        stage('Apply') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                dir(WORKING_DIR) {
+                    sh 'terraform apply -auto-approve tfplan'
+                }
+            }
+            post {
+                success {
+                    dir(WORKING_DIR) {
+                        sh 'terraform output -no-color 2>&1 | tee outputs.txt || true'
+                        archiveArtifacts artifacts: 'live/outputs.txt', allowEmptyArchive: true
+                    }
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────
+        // DESTROY
+        // ─────────────────────────────────────────────────────
+        stage('Destroy') {
+            when {
+                expression { params.ACTION == 'destroy' }
+            }
+            steps {
+                dir(WORKING_DIR) {
+                    sh """
+                        terraform destroy \\
+                          -var-file="${params.ENVIRONMENT}.tfvars" \\
+                          -auto-approve
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs(patterns: [[pattern: 'live/.terraform/**', type: 'INCLUDE']])
+        }
+        success {
+            echo "Pipeline completado: ${params.ACTION} en ${params.ENVIRONMENT} OK"
+        }
+        failure {
+            echo "Pipeline fallido: ${params.ACTION} en ${params.ENVIRONMENT}"
+        }
+    }
+}

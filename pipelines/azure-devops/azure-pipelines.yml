@@ -1,0 +1,232 @@
+trigger: none  # Solo ejecución manual o desde PR
+
+pr:
+  branches:
+    include: [main]
+  paths:
+    include: [live/**]
+
+parameters:
+  - name: environment
+    displayName: "Entorno"
+    type: string
+    default: dev
+    values: [dev, pre, prod]
+
+  - name: action
+    displayName: "Acción"
+    type: string
+    default: plan
+    values: [plan, apply, destroy]
+
+variables:
+  - group: terraform-global          # Variable group con: TF_BACKEND_RG, TF_BACKEND_SA
+  - name: TF_VERSION
+    value: "1.8.5"
+  - name: WORKING_DIR
+    value: "$(System.DefaultWorkingDirectory)/live"
+  - name: TF_VAR_FILE
+    value: "${{ parameters.environment }}.tfvars"
+  - name: STATE_KEY
+    value: "${{ parameters.environment }}.tfstate"
+
+  # Variable group por entorno: terraform-dev / terraform-pre / terraform-prod
+  # Cada uno contiene: SQL_ADMIN_PASSWORD
+  - ${{ if eq(parameters.environment, 'dev') }}:
+    - group: terraform-dev
+  - ${{ if eq(parameters.environment, 'pre') }}:
+    - group: terraform-pre
+  - ${{ if eq(parameters.environment, 'prod') }}:
+    - group: terraform-prod
+
+stages:
+  # ─────────────────────────────────────────────────────────────
+  # STAGE 1 — Validate
+  # ─────────────────────────────────────────────────────────────
+  - stage: Validate
+    displayName: "Validate"
+    jobs:
+      - job: validate
+        displayName: "fmt + validate"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - task: TerraformTaskV4@4
+            displayName: "terraform init"
+            inputs:
+              provider: azurerm
+              command: init
+              workingDirectory: $(WORKING_DIR)
+              backendServiceArm: "azure-service-connection"  # Nombre del Service Connection en Azure DevOps
+              backendAzureRmResourceGroupName: $(TF_BACKEND_RG)
+              backendAzureRmStorageAccountName: $(TF_BACKEND_SA)
+              backendAzureRmContainerName: tfstate
+              backendAzureRmKey: $(STATE_KEY)
+
+          - bash: terraform fmt -check -recursive
+            displayName: "terraform fmt"
+            workingDirectory: $(WORKING_DIR)
+
+          - task: TerraformTaskV4@4
+            displayName: "terraform validate"
+            inputs:
+              provider: azurerm
+              command: validate
+              workingDirectory: $(WORKING_DIR)
+              environmentServiceNameAzureRM: "azure-service-connection"
+
+  # ─────────────────────────────────────────────────────────────
+  # STAGE 2 — Plan
+  # ─────────────────────────────────────────────────────────────
+  - stage: Plan
+    displayName: "Plan (${{ parameters.environment }})"
+    dependsOn: Validate
+    jobs:
+      - job: plan
+        displayName: "terraform plan"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - task: TerraformTaskV4@4
+            displayName: "terraform init"
+            inputs:
+              provider: azurerm
+              command: init
+              workingDirectory: $(WORKING_DIR)
+              backendServiceArm: "azure-service-connection"
+              backendAzureRmResourceGroupName: $(TF_BACKEND_RG)
+              backendAzureRmStorageAccountName: $(TF_BACKEND_SA)
+              backendAzureRmContainerName: tfstate
+              backendAzureRmKey: $(STATE_KEY)
+
+          - task: TerraformTaskV4@4
+            displayName: "terraform plan"
+            inputs:
+              provider: azurerm
+              command: plan
+              workingDirectory: $(WORKING_DIR)
+              commandOptions: >
+                -var-file=$(TF_VAR_FILE)
+                -out=tfplan
+                -detailed-exitcode
+              environmentServiceNameAzureRM: "azure-service-connection"
+            env:
+              TF_VAR_sql_admin_password: $(SQL_ADMIN_PASSWORD)
+
+          - publish: $(WORKING_DIR)/tfplan
+            artifact: tfplan-${{ parameters.environment }}
+            displayName: "Publicar tfplan"
+
+  # ─────────────────────────────────────────────────────────────
+  # STAGE 3 — Apply
+  # Pre y Prod requieren aprobación manual:
+  #   Pipelines → Environments → pre/prod → Approvals and checks
+  # ─────────────────────────────────────────────────────────────
+  - stage: Apply
+    displayName: "Apply (${{ parameters.environment }})"
+    dependsOn: Plan
+    condition: |
+      and(
+        succeeded(),
+        eq('${{ parameters.action }}', 'apply')
+      )
+    jobs:
+      - deployment: apply
+        displayName: "terraform apply"
+        pool:
+          vmImage: ubuntu-latest
+        # Azure DevOps Environment — configura aquí los required approvers
+        environment: ${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: TerraformInstaller@1
+                  inputs:
+                    terraformVersion: $(TF_VERSION)
+
+                - task: TerraformTaskV4@4
+                  displayName: "terraform init"
+                  inputs:
+                    provider: azurerm
+                    command: init
+                    workingDirectory: $(WORKING_DIR)
+                    backendServiceArm: "azure-service-connection"
+                    backendAzureRmResourceGroupName: $(TF_BACKEND_RG)
+                    backendAzureRmStorageAccountName: $(TF_BACKEND_SA)
+                    backendAzureRmContainerName: tfstate
+                    backendAzureRmKey: $(STATE_KEY)
+
+                - download: current
+                  artifact: tfplan-${{ parameters.environment }}
+                  displayName: "Descargar tfplan"
+
+                - bash: cp $(Pipeline.Workspace)/tfplan-${{ parameters.environment }}/tfplan $(WORKING_DIR)/tfplan
+                  displayName: "Mover tfplan al working dir"
+
+                - task: TerraformTaskV4@4
+                  displayName: "terraform apply"
+                  inputs:
+                    provider: azurerm
+                    command: apply
+                    workingDirectory: $(WORKING_DIR)
+                    commandOptions: tfplan
+                    environmentServiceNameAzureRM: "azure-service-connection"
+                  env:
+                    TF_VAR_sql_admin_password: $(SQL_ADMIN_PASSWORD)
+
+  # ─────────────────────────────────────────────────────────────
+  # STAGE 4 — Destroy (solo manual, requiere aprobación siempre)
+  # ─────────────────────────────────────────────────────────────
+  - stage: Destroy
+    displayName: "Destroy (${{ parameters.environment }})"
+    dependsOn: []
+    condition: eq('${{ parameters.action }}', 'destroy')
+    jobs:
+      - deployment: destroy
+        displayName: "terraform destroy"
+        pool:
+          vmImage: ubuntu-latest
+        environment: ${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: TerraformInstaller@1
+                  inputs:
+                    terraformVersion: $(TF_VERSION)
+
+                - task: TerraformTaskV4@4
+                  displayName: "terraform init"
+                  inputs:
+                    provider: azurerm
+                    command: init
+                    workingDirectory: $(WORKING_DIR)
+                    backendServiceArm: "azure-service-connection"
+                    backendAzureRmResourceGroupName: $(TF_BACKEND_RG)
+                    backendAzureRmStorageAccountName: $(TF_BACKEND_SA)
+                    backendAzureRmContainerName: tfstate
+                    backendAzureRmKey: $(STATE_KEY)
+
+                - task: TerraformTaskV4@4
+                  displayName: "terraform destroy"
+                  inputs:
+                    provider: azurerm
+                    command: destroy
+                    workingDirectory: $(WORKING_DIR)
+                    commandOptions: -var-file=$(TF_VAR_FILE) -auto-approve
+                    environmentServiceNameAzureRM: "azure-service-connection"
+                  env:
+                    TF_VAR_sql_admin_password: $(SQL_ADMIN_PASSWORD)

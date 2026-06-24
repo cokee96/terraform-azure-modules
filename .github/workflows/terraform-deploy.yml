@@ -1,0 +1,265 @@
+name: Terraform Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Entorno a desplegar"
+        required: true
+        type: choice
+        options: [dev, pre, prod]
+      action:
+        description: "Acción a ejecutar"
+        required: true
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+
+  pull_request:
+    paths: ["live/**"]
+
+concurrency:
+  group: terraform-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 1 — Validate + Plan
+# Siempre se ejecuta. El output completo del plan queda visible en los logs
+# y como artefacto descargable. En PRs también se comenta en el diff.
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  plan:
+    name: "Plan → ${{ github.event.inputs.environment || 'dev' }}"
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+
+    env:
+      TF_VAR_sql_admin_password: ${{ secrets.SQL_ADMIN_PASSWORD }}
+      ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC:        "true"
+
+    defaults:
+      run:
+        working-directory: live/
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.8"
+
+      - name: Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_BACKEND_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TF_BACKEND_SA }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=${{ github.event.inputs.environment || 'dev' }}.tfstate"
+
+      - name: Format check
+        run: terraform fmt -check -recursive
+
+      - name: Validate
+        run: terraform validate
+
+      # El plan se ejecuta siempre — su salida queda en los logs del job
+      - name: Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan \
+            -var-file="${{ github.event.inputs.environment || 'dev' }}.tfvars" \
+            -out=tfplan \
+            -no-color 2>&1 | tee plan.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+
+          # exit 0 = sin cambios, 2 = hay cambios, 1 = error
+          if [ "$EXIT_CODE" -eq 1 ]; then
+            echo "El plan ha fallado."
+            exit 1
+          fi
+
+          HAS_CHANGES=$( [ "$EXIT_CODE" -eq 2 ] && echo "true" || echo "false" )
+          echo "has_changes=$HAS_CHANGES" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.event.inputs.environment || 'dev' }}-${{ github.run_id }}
+          path: |
+            live/tfplan
+            live/plan.txt
+          retention-days: 5
+
+      # ── Comentar el plan en PRs para revisión antes del merge ───────────
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('live/plan.txt', 'utf8');
+            const maxLen = 60000;
+            const truncated = plan.length > maxLen;
+            const planBody = truncated ? plan.substring(plan.length - maxLen) : plan;
+
+            // Extrae el resumen (última línea con "Plan: X to add, Y to change, Z to destroy")
+            const summary = plan.match(/Plan:.+/)?.[0] ?? plan.match(/No changes.+/)?.[0] ?? '';
+
+            const body = [
+              `## Terraform Plan — \`${{ github.event.inputs.environment || 'dev' }}\``,
+              '',
+              summary ? `> ${summary}` : '',
+              '',
+              truncated ? '> ⚠️ Plan truncado — descarga el artefacto para verlo completo.' : '',
+              '',
+              '<details>',
+              '<summary>Ver plan completo</summary>',
+              '',
+              '```hcl',
+              planBody,
+              '```',
+              '</details>',
+            ].join('\n');
+
+            // Borra comentarios anteriores del bot para no acumular
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            for (const c of comments.data) {
+              if (c.user.type === 'Bot' && c.body.startsWith('## Terraform Plan')) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: c.id,
+                });
+              }
+            }
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 2 — Apply
+  # Solo se ejecuta si action=apply. Usa un GitHub Environment con required
+  # reviewers → el responsable recibe una notificación, lee el plan del job
+  # anterior y aprueba o rechaza desde la UI de GitHub Actions.
+  #
+  # Configuración:
+  #   Settings → Environments → dev / pre / prod → Required reviewers
+  # ─────────────────────────────────────────────────────────────────────────────
+  apply:
+    name: "Apply → ${{ github.event.inputs.environment }}"
+    needs: plan
+    if: |
+      github.event.inputs.action == 'apply' &&
+      needs.plan.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+
+    # Este environment activa la pantalla de aprobación manual en GitHub
+    environment: ${{ github.event.inputs.environment }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      TF_VAR_sql_admin_password: ${{ secrets.SQL_ADMIN_PASSWORD }}
+      ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC:        "true"
+
+    defaults:
+      run:
+        working-directory: live/
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.8"
+
+      - name: Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_BACKEND_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TF_BACKEND_SA }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=${{ github.event.inputs.environment }}.tfstate"
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.event.inputs.environment }}-${{ github.run_id }}
+          path: live/
+
+      - name: Apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Show outputs
+        run: terraform output -no-color || true
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 3 — Destroy
+  # También requiere aprobación via GitHub Environment.
+  # ─────────────────────────────────────────────────────────────────────────────
+  destroy:
+    name: "Destroy → ${{ github.event.inputs.environment }}"
+    needs: plan
+    if: github.event.inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      TF_VAR_sql_admin_password: ${{ secrets.SQL_ADMIN_PASSWORD }}
+      ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC:        "true"
+
+    defaults:
+      run:
+        working-directory: live/
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.8"
+
+      - name: Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_BACKEND_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TF_BACKEND_SA }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=${{ github.event.inputs.environment }}.tfstate"
+
+      - name: Destroy
+        run: |
+          terraform destroy \
+            -var-file="${{ github.event.inputs.environment }}.tfvars" \
+            -auto-approve
