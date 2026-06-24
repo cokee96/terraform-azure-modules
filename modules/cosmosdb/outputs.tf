@@ -20,9 +20,9 @@ output "primary_key" {
 }
 
 output "primary_connection_string" {
-  value       = azurerm_cosmosdb_account.this.connection_strings[0]
+  value       = azurerm_cosmosdb_account.this.primary_sql_connection_string
   sensitive   = true
-  description = "Primary connection string for the Cosmos DB account."
+  description = "Primary SQL connection string for the Cosmos DB account."
 }
 
 output "sql_database_id" {
