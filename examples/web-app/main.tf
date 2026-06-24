@@ -53,8 +53,8 @@ module "vnet" {
       service_endpoints = ["Microsoft.KeyVault", "Microsoft.Sql", "Microsoft.Storage"]
     },
     {
-      name             = "data"
-      address_prefixes = ["10.1.2.0/24"]
+      name              = "data"
+      address_prefixes  = ["10.1.2.0/24"]
       service_endpoints = ["Microsoft.Sql", "Microsoft.Storage"]
     },
     {
@@ -95,7 +95,7 @@ module "storage" {
   account_replication_type        = "LRS"
   allow_nested_items_to_be_public = false
   containers = [
-    { name = "assets",  access_type = "private" },
+    { name = "assets", access_type = "private" },
     { name = "uploads", access_type = "private" },
   ]
   tags = local.tags

@@ -93,7 +93,7 @@ module "service_bus" {
   location            = module.resource_group.location
   sku                 = "Standard"
   queues = [
-    { name = "orders",        enable_partitioning = true },
+    { name = "orders", enable_partitioning = true },
     { name = "notifications" },
   ]
   topics = [
