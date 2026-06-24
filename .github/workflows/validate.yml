@@ -16,6 +16,18 @@ jobs:
           - modules/aks
           - modules/acr
           - modules/keyvault
+          - modules/storage-account
+          - modules/app-service
+          - modules/sql-database
+          - modules/redis-cache
+          - modules/monitoring
+          - modules/private-endpoint
+          - modules/nsg
+          - modules/managed-identity
+          - modules/service-bus
+          - modules/cosmosdb
+          - modules/function-app
+          - modules/event-hub
 
     steps:
       - uses: actions/checkout@v4
