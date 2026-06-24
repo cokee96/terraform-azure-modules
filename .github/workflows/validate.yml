@@ -1,0 +1,47 @@
+name: Validate Terraform modules
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module:
+          - modules/resource-group
+          - modules/vnet
+          - modules/aks
+          - modules/acr
+          - modules/keyvault
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.8"
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+        working-directory: ${{ matrix.module }}
+
+      - name: terraform init
+        run: terraform init -backend=false
+        working-directory: ${{ matrix.module }}
+
+      - name: terraform validate
+        run: terraform validate
+        working-directory: ${{ matrix.module }}
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: tflint
+        run: |
+          tflint --init
+          tflint
+        working-directory: ${{ matrix.module }}
