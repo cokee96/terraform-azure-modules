@@ -12,7 +12,16 @@ module "vnet" {
   location            = module.resource_group.location
   address_space       = ["10.0.0.0/16"]
   subnets = [
-    { name = "aks-nodes", address_prefix = "10.0.1.0/24" }
+    {
+      name              = "aks-nodes"
+      address_prefixes  = ["10.0.1.0/24"]
+      service_endpoints = ["Microsoft.ContainerRegistry"]
+    },
+    {
+      name                                      = "endpoints"
+      address_prefixes                          = ["10.0.2.0/24"]
+      private_endpoint_network_policies_enabled = false
+    },
   ]
   tags = local.tags
 }

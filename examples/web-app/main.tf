@@ -5,6 +5,39 @@ module "resource_group" {
   tags     = local.tags
 }
 
+# NSG for the application subnet — allow HTTPS inbound, deny everything else
+module "nsg_app" {
+  source              = "../../modules/nsg"
+  name                = "nsg-app-${local.prefix}"
+  resource_group_name = module.resource_group.name
+  location            = module.resource_group.location
+  rules = [
+    {
+      name                       = "allow-https-inbound"
+      priority                   = 100
+      direction                  = "Inbound"
+      access                     = "Allow"
+      protocol                   = "Tcp"
+      source_port_range          = "*"
+      destination_port_range     = "443"
+      source_address_prefix      = "Internet"
+      destination_address_prefix = "*"
+    },
+    {
+      name                       = "allow-http-inbound"
+      priority                   = 110
+      direction                  = "Inbound"
+      access                     = "Allow"
+      protocol                   = "Tcp"
+      source_port_range          = "*"
+      destination_port_range     = "80"
+      source_address_prefix      = "Internet"
+      destination_address_prefix = "*"
+    },
+  ]
+  tags = local.tags
+}
+
 module "vnet" {
   source              = "../../modules/vnet"
   name                = "vnet-${local.prefix}"
@@ -12,9 +45,24 @@ module "vnet" {
   location            = module.resource_group.location
   address_space       = ["10.1.0.0/16"]
   subnets = [
-    { name = "app", address_prefixes = ["10.1.1.0/24"] },
-    { name = "data", address_prefixes = ["10.1.2.0/24"] },
-    { name = "endpoints", address_prefixes = ["10.1.3.0/24"] },
+    {
+      name             = "app"
+      address_prefixes = ["10.1.1.0/24"]
+      nsg_id           = module.nsg_app.id
+      # Service endpoints allow KeyVault and SQL to restrict access to this subnet
+      service_endpoints = ["Microsoft.KeyVault", "Microsoft.Sql", "Microsoft.Storage"]
+    },
+    {
+      name             = "data"
+      address_prefixes = ["10.1.2.0/24"]
+      service_endpoints = ["Microsoft.Sql", "Microsoft.Storage"]
+    },
+    {
+      # Private endpoints require this to be false so the subnet can assign IPs to PEPs
+      name                                      = "endpoints"
+      address_prefixes                          = ["10.1.3.0/24"]
+      private_endpoint_network_policies_enabled = false
+    },
   ]
   tags = local.tags
 }
@@ -47,7 +95,7 @@ module "storage" {
   account_replication_type        = "LRS"
   allow_nested_items_to_be_public = false
   containers = [
-    { name = "assets", access_type = "private" },
+    { name = "assets",  access_type = "private" },
     { name = "uploads", access_type = "private" },
   ]
   tags = local.tags
@@ -93,11 +141,13 @@ module "app_service" {
     SQL_DATABASE_NAME                     = module.sql.database_name
     STORAGE_ACCOUNT_NAME                  = module.storage.name
     STORAGE_BLOB_ENDPOINT                 = module.storage.primary_blob_endpoint
+    KEYVAULT_URI                          = module.keyvault.vault_uri
   }
   tags = local.tags
 }
 
-module "private_endpoint_sql" {
+# Private endpoints — all pointing at the dedicated endpoints subnet
+module "pe_sql" {
   source                         = "../../modules/private-endpoint"
   name                           = "pe-sql-${local.prefix}"
   resource_group_name            = module.resource_group.name
@@ -105,6 +155,28 @@ module "private_endpoint_sql" {
   subnet_id                      = module.vnet.subnet_ids["endpoints"]
   private_connection_resource_id = module.sql.server_id
   subresource_names              = ["sqlServer"]
+  tags                           = local.tags
+}
+
+module "pe_keyvault" {
+  source                         = "../../modules/private-endpoint"
+  name                           = "pe-kv-${local.prefix}"
+  resource_group_name            = module.resource_group.name
+  location                       = module.resource_group.location
+  subnet_id                      = module.vnet.subnet_ids["endpoints"]
+  private_connection_resource_id = module.keyvault.id
+  subresource_names              = ["vault"]
+  tags                           = local.tags
+}
+
+module "pe_storage_blob" {
+  source                         = "../../modules/private-endpoint"
+  name                           = "pe-st-blob-${local.prefix}"
+  resource_group_name            = module.resource_group.name
+  location                       = module.resource_group.location
+  subnet_id                      = module.vnet.subnet_ids["endpoints"]
+  private_connection_resource_id = module.storage.id
+  subresource_names              = ["blob"]
   tags                           = local.tags
 }
 
