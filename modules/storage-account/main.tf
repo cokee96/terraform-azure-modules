@@ -13,6 +13,6 @@ resource "azurerm_storage_container" "this" {
   for_each = { for c in var.containers : c.name => c }
 
   name                  = each.value.name
-  storage_account_name  = azurerm_storage_account.this.name
+  storage_account_id    = azurerm_storage_account.this.id
   container_access_type = lookup(each.value, "access_type", "private")
 }

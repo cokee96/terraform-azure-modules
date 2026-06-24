@@ -15,7 +15,7 @@ resource "azurerm_subnet" "this" {
   address_prefixes     = each.value.address_prefixes
   service_endpoints    = each.value.service_endpoints
 
-  private_endpoint_network_policies_enabled = each.value.private_endpoint_network_policies_enabled
+  private_endpoint_network_policies = each.value.private_endpoint_network_policies_enabled ? "Enabled" : "Disabled"
 
   dynamic "delegation" {
     for_each = each.value.delegation != null ? [each.value.delegation] : []

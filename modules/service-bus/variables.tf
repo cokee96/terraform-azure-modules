@@ -26,8 +26,8 @@ variable "sku" {
 
 variable "queues" {
   type = list(object({
-    name                = string
-    enable_partitioning = optional(bool, false)
+    name                 = string
+    partitioning_enabled = optional(bool, false)
   }))
   description = "List of queues to create inside the namespace. Topics require Standard or Premium SKU."
   default     = []

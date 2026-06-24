@@ -6,6 +6,6 @@ resource "azurerm_redis_cache" "this" {
   family              = var.family
   sku_name            = var.sku_name
   minimum_tls_version = "1.2"
-  enable_non_ssl_port = false
+  non_ssl_port_enabled = false
   tags                = var.tags
 }

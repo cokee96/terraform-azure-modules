@@ -12,7 +12,7 @@ resource "azurerm_servicebus_queue" "this" {
   name         = each.value.name
   namespace_id = azurerm_servicebus_namespace.this.id
 
-  enable_partitioning = lookup(each.value, "enable_partitioning", false)
+  partitioning_enabled = lookup(each.value, "partitioning_enabled", false)
 }
 
 resource "azurerm_servicebus_topic" "this" {

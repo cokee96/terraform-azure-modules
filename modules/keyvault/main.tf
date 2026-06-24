@@ -8,7 +8,7 @@ resource "azurerm_key_vault" "this" {
   sku_name                    = var.sku_name
   soft_delete_retention_days  = var.soft_delete_retention_days
   purge_protection_enabled    = var.purge_protection_enabled
-  enable_rbac_authorization   = var.enable_rbac_authorization
+  rbac_authorization_enabled  = var.enable_rbac_authorization
   tags                        = var.tags
 
   dynamic "network_acls" {
