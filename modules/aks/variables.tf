@@ -66,6 +66,12 @@ variable "enable_azure_rbac" {
   default     = false
 }
 
+variable "admin_group_object_ids" {
+  type        = list(string)
+  description = "Object IDs of AAD groups with cluster admin role (required when enable_azure_rbac=true)."
+  default     = []
+}
+
 variable "tags" {
   type        = map(string)
   description = "Tags to apply."

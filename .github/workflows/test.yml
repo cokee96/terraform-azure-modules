@@ -1,0 +1,76 @@
+name: Terraform Tests & Security Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+
+  # ── Mock provider tests (sin credenciales Azure) ───────────────────────────
+  mock-tests:
+    name: Unit Tests — ${{ matrix.module }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - modules/resource-group
+          - modules/vnet
+          - modules/aks
+          - modules/keyvault
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.9"
+
+      - name: terraform init
+        run: terraform init -backend=false
+        working-directory: ${{ matrix.module }}
+
+      - name: terraform test (mock provider)
+        run: terraform test
+        working-directory: ${{ matrix.module }}
+
+  # ── Checkov security scan ─────────────────────────────────────────────────
+  checkov:
+    name: Security Scan (Checkov)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: modules/
+          config_file: .checkov.yaml
+          framework: terraform
+          output_format: cli,sarif
+          output_file_path: console,checkov-results.sarif
+          soft_fail: true
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+
+  # ── Resumen: todos los jobs deben pasar ───────────────────────────────────
+  all-tests-pass:
+    name: All tests passed
+    runs-on: ubuntu-latest
+    needs: [mock-tests, checkov]
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          if [[ "${{ needs.mock-tests.result }}" != "success" ]]; then
+            echo "❌ Mock tests failed"
+            exit 1
+          fi
+          echo "✅ All tests passed"

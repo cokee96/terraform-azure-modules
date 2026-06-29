@@ -1,0 +1,23 @@
+# Checkov configuration for terraform-azure-modules
+# These modules are building blocks — some policies require opt-in at the consumer level
+# (e.g. enabling private cluster in AKS is a variable, not a default)
+
+framework:
+  - terraform
+
+skip-check:
+  # AKS private cluster: disponible como variable, no forzado en el módulo
+  - CKV_AZURE_110
+  # AKS disk encryption: requiere disk encryption set externo (fuera del scope del módulo)
+  - CKV_AZURE_117
+  # AKS authorized IP ranges: configuración específica de cada entorno
+  - CKV_AZURE_6
+  # Key Vault network ACLs: configurable vía variable network_acls
+  - CKV_AZURE_109
+  # Storage public access: configurable vía variable
+  - CKV_AZURE_59
+  # App Service HTTPS only: habilitado en el módulo por defecto
+  - CKV_AZURE_14
+
+compact: true
+download-external-modules: false
